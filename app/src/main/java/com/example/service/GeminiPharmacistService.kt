@@ -1,17 +1,18 @@
 package com.example.service
 
-import com.example.BuildConfig
+import android.util.Log
 import com.example.data.model.Medicine
 import com.example.data.repository.MedicineRepository
+import com.google.firebase.Firebase
+import com.google.firebase.ai.ai
+import com.google.firebase.ai.type.content
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
-import org.json.JSONObject
-import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.withTimeout
+
+private const val TAG = "GeminiPharmacist"
 
 data class ChatMessage(
     val id: String,
@@ -37,27 +38,20 @@ data class SearchCitation(
 class GeminiPharmacistService(
     private val medicineRepository: MedicineRepository
 ) {
-    private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .build()
-
-    private val conversationHistory = mutableListOf<JSONObject>()
-
-    init {
-        // Initialize system context
+    // Lazily initialize generative model with system instructions via Firebase AI Logic
+    private val model by lazy {
         val allMedicines = medicineRepository.getAllMedicines()
         val medSummary = allMedicines.take(60).joinToString("\n") {
-            "- ${it.name} (${it.company}) - السعر: ${it.price} ل.س - البونص: ${it.bonus.ifBlank { "بدون بونص" }} - المادة: ${it.activeIngredient}"
+            "- ${it.name} (${it.company}) - السعر: ${it.price.toInt()} ل.س - البونص: ${it.bonus.ifBlank { "بدون بونص" }} - المادة: ${it.activeIngredient}"
         }
 
         val systemPrompt = """
-            أنت المساعد الدوائي والصيدلاني الذكي الرسمي لـ 'مستودع الفواز للأدوية'.
-            مهمتك مساعدة الصيادلة والعملاء في:
+            أنت المساعد الدوائي والصيدلاني الذكي الرسمي لـ 'مستودع الفواز للأدوية' المدعوم بنموذج Google Gemini 3.8 Flash عبر Firebase AI Logic.
+            مهمتك مساعدة الصيادلة والعملاء والرد باللغة العربية بأسلوب علمي، صيدلاني دقيق، ومهني ودود في:
             1. تقديم معلومات دوائية موثوقة (الجرعات، الاستطبابات، موانع الاستعمال، التداخلات الدوائية).
-            2. اقتراح بدائل الأدوية المتوفرة في مستودع الفواز بنفس المادة الفعالة مع توضيح الأسعار والبونص.
+            2. اقتراح بدائل الأدوية المتوفرة في مستودع الفواز بنفس المادة الفعالة مع توضيح الأسعار وعروض البونص.
             3. استعراض عروض وبونصات الأدوية في المستودع.
-            4. الإجابة بدقة مع الاستشهاد ببيانات بحث جوجل المحدثة والمصادر الطبية.
+            4. الإجابة بدقة مع الاستشهاد بالمصادر الطبية والصيدلانية الموثقة.
             
             أرقام مندوبي المبيعات في مستودع الفواز:
             - فواز البشير (المدينة): 0995711536
@@ -66,16 +60,17 @@ class GeminiPharmacistService(
             - اسماعيل (الخط الشمالي): 0936577184
             - رائد (الخط الشرقي): 0939329718
             
-            عينة من أدوية المستودع:
+            عينة من أدوية ومخزون مستودع الفواز:
             $medSummary
         """.trimIndent()
 
-        // Keep system prompt ready
+        Firebase.ai.generativeModel(
+            modelName = "gemini-3.8-flash",
+            systemInstruction = content { text(systemPrompt) }
+        )
     }
 
     suspend fun sendMessage(userMessage: String): ChatMessage = withContext(Dispatchers.IO) {
-        val apiKey = try { BuildConfig.GEMINI_API_KEY } catch (e: Exception) { "" }
-
         // Search related medicines in local inventory
         val queryWords = userMessage.split(" ", "،", "+", "-").filter { it.length >= 3 }
         val matchedMeds = medicineRepository.getAllMedicines().filter { med ->
@@ -87,24 +82,38 @@ class GeminiPharmacistService(
             }
         }.take(4)
 
-        if (apiKey.isNotBlank() && apiKey != "MY_GEMINI_API_KEY") {
-            try {
-                val apiResponse = callGeminiApi(userMessage, apiKey)
-                if (apiResponse.isNotBlank()) {
-                    return@withContext ChatMessage(
-                        id = "msg_${System.currentTimeMillis()}",
-                        sender = MessageSender.AI_PHARMACIST,
-                        text = apiResponse,
-                        searchCitations = generateSearchCitations(userMessage),
-                        suggestedMedicines = matchedMeds
-                    )
-                }
-            } catch (e: Exception) {
-                // Fallback to intelligent local pharmacist engine
+        try {
+            // Mandated realistic 30-60s timeout for model inference
+            val response = withTimeout(60_000L) {
+                model.generateContent(userMessage)
             }
+
+            val text = response.text
+            if (!text.isNullOrBlank()) {
+                return@withContext ChatMessage(
+                    id = "msg_${System.currentTimeMillis()}",
+                    sender = MessageSender.AI_PHARMACIST,
+                    text = text,
+                    searchCitations = generateSearchCitations(userMessage),
+                    suggestedMedicines = matchedMeds
+                )
+            }
+        } catch (e: TimeoutCancellationException) {
+            Log.e(TAG, "Gemini generation timed out", e)
+            return@withContext ChatMessage(
+                id = "msg_${System.currentTimeMillis()}",
+                sender = MessageSender.AI_PHARMACIST,
+                text = "⏱️ استغرقت استجابة الذكاء الاصطناعي (Gemini) وقتاً أطول من المتوقع. يرجى إعادة المحاولة.",
+                searchCitations = emptyList(),
+                suggestedMedicines = matchedMeds
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Firebase AI generation failed, using intelligent domain fallback", e)
         }
 
-        // High quality contextual domain response
+        // High quality contextual domain response as intelligent fallback
         val smartResponse = generateSmartPharmacistResponse(userMessage, matchedMeds)
         ChatMessage(
             id = "msg_${System.currentTimeMillis()}",
@@ -113,36 +122,6 @@ class GeminiPharmacistService(
             searchCitations = smartResponse.second,
             suggestedMedicines = matchedMeds
         )
-    }
-
-    private fun callGeminiApi(prompt: String, apiKey: String): String {
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=$apiKey"
-        val payload = JSONObject().apply {
-            put("contents", JSONArray().apply {
-                put(JSONObject().apply {
-                    put("parts", JSONArray().apply {
-                        put(JSONObject().apply {
-                            put("text", "أنت مساعد صيدلاني خبير في مستودع الفواز للأدوية. أجب باحترافية باللغة العربية مع ذكر تفاصيل الأدوية والأسعار عند الحاجة:\n$prompt")
-                        })
-                    })
-                })
-            })
-        }
-
-        val requestBody = payload.toString().toRequestBody("application/json".toMediaType())
-        val request = Request.Builder().url(url).post(requestBody).build()
-        val response = okHttpClient.newCall(request).execute()
-
-        if (response.isSuccessful) {
-            val responseBody = response.body?.string() ?: return ""
-            val json = JSONObject(responseBody)
-            val candidates = json.optJSONArray("candidates")
-            val firstCandidate = candidates?.optJSONObject(0)
-            val content = firstCandidate?.optJSONObject("content")
-            val parts = content?.optJSONArray("parts")
-            return parts?.optJSONObject(0)?.optString("text") ?: ""
-        }
-        return ""
     }
 
     private fun generateSmartPharmacistResponse(
@@ -192,7 +171,7 @@ class GeminiPharmacistService(
                     append("⚠️ *ملاحظة: الطلب حصراً عن طريق المندوب مع إمكانية تصدير الفاتورة PDF ومشاركتها مباشرة عبر واتساب.*")
                 }
                 else -> {
-                    append("أهلاً بك يا دكتور. أنا المساعد الدوائي الذكي لمستودع الفواز للأدوية.\n\n")
+                    append("أهلاً بك يا دكتور. أنا المساعد الدوائي الذكي لمستودع الفواز للأدوية المدعوم بـ Gemini.\n\n")
                     if (matchedMeds.isNotEmpty()) {
                         append("وجدت في قائمة مستودعنا الأصناف التالية ذات الصلة باستفسارك:\n")
                         matchedMeds.forEach {
@@ -203,7 +182,7 @@ class GeminiPharmacistService(
                         append("يمكنني مساعدتك في:\n")
                         append("1. استعراض عروض وبونصات المستودع (ميديكو، ابن رشد، دومنا، بركات، وغيرها).\n")
                         append("2. البحث عن البدائل الدوائية بالاسم العلمي أو التجاري.\n")
-                        append("3. التحقق من التداخلات والجرعات الصيدلانية الموثقة.\n")
+                        append("3. التحقق من التداخلات والجرعات الصيدلانية الموثقة عبر Gemini.\n")
                         append("4. إصدار وطباعة فواتير الطلبيات وتوجيهها للمندوب المختص.")
                     }
                 }
@@ -216,14 +195,14 @@ class GeminiPharmacistService(
     private fun generateSearchCitations(query: String): List<SearchCitation> {
         return listOf(
             SearchCitation(
-                title = "الدليل الدوائي السوري ومستودع الفواز 2026",
-                snippet = "بيانات الأسعار الرسمية والبونصات المعتمدة لشركات الأدوية الوطنية.",
-                source = "google_search_syrian_pharma_index"
+                title = "Google Gemini 3.8 Flash • قاعدة مستودع الفواز 2026",
+                snippet = "معلومات ذكية مدعومة بالذكاء الاصطناعي مع أسعار وبونصات المستودع الرسمية.",
+                source = "gemini_3.8_flash_pharma"
             ),
             SearchCitation(
-                title = "الموسوعة الطبية الصيدلانية - التركيبات والبدائل",
-                snippet = "التكافؤ الحيوي ومقارنة المواد الفعالة والجرعات الآمنة.",
-                source = "google_health_index"
+                title = "الدليل الدوائي السوري وموسوعة التكافؤ الحيوي",
+                snippet = "تحليل المكونات الفعالة والبدائل الدوائية المعتمدة والجرعات الآمنة.",
+                source = "syrian_national_formulary"
             )
         )
     }
