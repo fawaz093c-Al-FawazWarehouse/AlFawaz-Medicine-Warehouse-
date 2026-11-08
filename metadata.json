@@ -1,0 +1,8 @@
+{
+  "name": "Remix مستودع الفواز للأدوية",
+  "description": "تطبيق مستودع الفواز للأدوية ومواد التجميل - طلبات الصيادلة، بونصات وعروض، تنبيهات انخفاض الأسعار، مساعد دوائي ذكي، وإصدار الفواتير PDF",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
